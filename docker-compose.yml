@@ -12,7 +12,11 @@ services:
 
   omnirag-alpha:
     image: ghcr.io/krisclarkdev/omnirag:main
+    # ⚠️ Required on Linux so the container can reach services on the host (e.g., Open WebUI)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
+      # ⚠️ Change the left port if 3000 is already in use (e.g., "3001:3000")
       - "3000:3000"
     volumes:
       # ⚠️ Your documents — change ./alpha-docs to your local folder path

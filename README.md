@@ -572,15 +572,63 @@ entrypoint.sh
 ```yaml
 services:
   omnirag:
-    build: .
+    image: ghcr.io/krisclarkdev/omnirag:main
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "3000:3000"
     volumes:
-      - ./my-documents:/rag  # Your files (change path as needed)
-      - ./redis_data:/data   # Redis AOF persistence
+      - ./my-documents:/rag:ro  # Your files (change path as needed)
     environment:
+      - REDIS_URL=redis://redis:6379/0
       - RUST_LOG=info,omnirag=debug
     restart: unless-stopped
+```
+
+### Networking: Connecting to Open WebUI
+
+OmniRAG runs inside a Docker container and needs to reach your Open WebUI API. This requires special configuration when both services run on the same host.
+
+#### Same-Host Deployment (Open WebUI on the same machine)
+
+From inside a Docker container, `localhost` refers to the container itself — not the host machine. To reach services on the Docker host:
+
+1. **Add `extra_hosts`** to your `docker-compose.yml` (required on Linux):
+
+```yaml
+  omnirag-alpha:
+    image: ghcr.io/krisclarkdev/omnirag:main
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+
+2. **Set the Open WebUI URL** in the OmniRAG config to:
+
+```
+http://host.docker.internal:<PORT>
+```
+
+where `<PORT>` is the port Open WebUI listens on (e.g., `3000`, `8080`).
+
+> **Tip:** To find which port Open WebUI uses, run `curl -s http://localhost:<PORT>/api/v1/knowledge/` from the host — the port that returns JSON is the correct one.
+
+#### Remote Open WebUI (different machine)
+
+If Open WebUI runs on a different server, use its hostname or IP directly:
+
+```
+https://openwebui.yourdomain.com
+```
+
+No `extra_hosts` needed in this case.
+
+### Port Customization
+
+If port 3000 is already in use on your host (e.g., by Open WebUI), change the **left** side of the port mapping:
+
+```yaml
+    ports:
+      - "3001:3000"  # Access OmniRAG at http://your-server:3001
 ```
 
 ### Multi-Container Deployment (One Container per Collection)
@@ -597,11 +645,13 @@ services:
       - ./redis-alpha:/data
 
   omnirag-alpha:
-    build: .
+    image: ghcr.io/krisclarkdev/omnirag:main
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "3000:3000"
     volumes:
-      - ./alpha-docs:/rag
+      - ./alpha-docs:/rag:ro
     environment:
       - REDIS_URL=redis://redis-alpha:6379/0
       - RUST_LOG=info,omnirag=debug
@@ -617,11 +667,13 @@ services:
       - ./redis-beta:/data
 
   omnirag-beta:
-    build: .
+    image: ghcr.io/krisclarkdev/omnirag:main
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "3001:3000"
     volumes:
-      - ./beta-docs:/rag
+      - ./beta-docs:/rag:ro
     environment:
       - REDIS_URL=redis://redis-beta:6379/0
       - RUST_LOG=info,omnirag=debug
