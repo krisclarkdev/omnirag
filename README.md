@@ -107,15 +107,19 @@ services:
     restart: unless-stopped
 EOF
 
-# 4. Pull and start
+# 4. ⚠️ Edit docker-compose.yml — replace /path/to/your/documents
+#    with the absolute path to your local documents folder, e.g.:
+#    - /home/kris/knowledge-docs:/rag:ro
+
+# 5. Pull and start
 docker compose pull
 docker compose up -d
 
-# 5. Verify
+# 6. Verify
 docker compose ps
 docker compose logs -f omnirag
 
-# 6. Open http://your-server:3000 → Configure → Trigger Sync
+# 7. Open http://your-server:3000 → Configure → Trigger Sync
 ```
 
 ### Updating to Latest Version
