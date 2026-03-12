@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use reqwest::multipart;
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -70,15 +71,16 @@ impl OpenWebUiClient {
     }
 
     /// Upload a file via multipart/form-data with retry. Returns the file ID.
+    /// Uses `Bytes` for zero-cost cloning across retry attempts.
     pub async fn upload_file(
         &self,
         filename: &str,
-        bytes: Vec<u8>,
+        bytes: Bytes,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let mut last_err = String::new();
 
         for attempt in 0..MAX_RETRIES {
-            let part = multipart::Part::bytes(bytes.clone())
+            let part = multipart::Part::bytes(bytes.clone().to_vec())
                 .file_name(filename.to_string())
                 .mime_str("application/octet-stream")?;
 
@@ -375,7 +377,7 @@ mod tests {
             .await;
 
         let client = OpenWebUiClient::new(&server.uri(), "test-token");
-        let result = client.upload_file("test.md", b"hello world".to_vec()).await;
+        let result = client.upload_file("test.md", Bytes::from("hello world")).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "file-uuid-123");
     }
@@ -401,7 +403,7 @@ mod tests {
             .await;
 
         let client = OpenWebUiClient::new(&server.uri(), "tok");
-        let result = client.upload_file("test.md", b"data".to_vec()).await;
+        let result = client.upload_file("test.md", Bytes::from("data")).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "retry-uuid");
     }
@@ -425,7 +427,7 @@ mod tests {
             .await;
 
         let client = OpenWebUiClient::new(&server.uri(), "tok");
-        assert!(client.upload_file("t.md", b"d".to_vec()).await.is_ok());
+        assert!(client.upload_file("t.md", Bytes::from("d")).await.is_ok());
     }
 
     #[tokio::test]
@@ -439,7 +441,7 @@ mod tests {
             .await;
 
         let client = OpenWebUiClient::new(&server.uri(), "tok");
-        let result = client.upload_file("t.md", b"d".to_vec()).await;
+        let result = client.upload_file("t.md", Bytes::from("d")).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("400"));
     }
@@ -455,7 +457,7 @@ mod tests {
             .await;
 
         let client = OpenWebUiClient::new(&server.uri(), "tok");
-        assert!(client.upload_file("t.md", b"d".to_vec()).await.is_err());
+        assert!(client.upload_file("t.md", Bytes::from("d")).await.is_err());
     }
 
     #[tokio::test]

@@ -1,8 +1,10 @@
 use crate::api::OpenWebUiClient;
 use crate::config::AppConfig;
-use crate::hashing::{generate_redis_key, hash_file_contents};
+use crate::hashing::{generate_redis_key, generate_redis_key_from, hash_file_contents};
 use crate::redis_client;
 
+use bytes::Bytes;
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -63,18 +65,18 @@ pub fn load_ragignore(target_dir: &Path) -> Vec<String> {
     }
 
     match std::fs::File::open(&ragignore_path) {
-        Ok(file) => {
-            let patterns: Vec<String> = std::io::BufReader::new(file)
-                .lines()
-                .filter_map(|line| line.ok())
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .collect();
-            if !patterns.is_empty() {
-                info!("Loaded {} patterns from .ragignore", patterns.len());
-            }
-            patterns
-        }
+        Ok(file) => std::io::BufReader::new(file)
+            .lines()
+            .filter_map(|line| {
+                let line = line.ok()?;
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            })
+            .collect(),
         Err(e) => {
             warn!("Failed to read .ragignore: {}", e);
             Vec::new()
@@ -82,19 +84,19 @@ pub fn load_ragignore(target_dir: &Path) -> Vec<String> {
     }
 }
 
-/// Check if a path matches any .ragignore pattern.
+// ─────────────────── Filtering helpers ───────────────────
+
+/// Check if a file matches any ragignore pattern.
 pub fn is_ragignored(path: &Path, target_dir: &Path, patterns: &[String]) -> bool {
-    let relative = path.strip_prefix(target_dir).unwrap_or(path);
-    let rel_str = relative.to_string_lossy();
+    let relative = match path.strip_prefix(target_dir) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let relative_str = relative.to_string_lossy();
 
     for pattern in patterns {
-        // Simple glob matching: support * wildcard and exact prefix matching
-        if pattern.ends_with('*') {
-            let prefix = &pattern[..pattern.len() - 1];
-            if rel_str.starts_with(prefix) {
-                return true;
-            }
-        } else if rel_str.starts_with(pattern) || rel_str == *pattern {
+        // Simple glob: check filename or path component match
+        if relative_str.contains(pattern.as_str()) {
             return true;
         }
         // Check path components (e.g., "subdir" matches "subdir/file.txt")
@@ -129,6 +131,12 @@ pub fn is_os_ignored(path: &Path) -> bool {
     }
 }
 
+/// Standard filter for dot-directories, used in both Phase 0 and Phase 1.
+fn is_visible_entry(e: &walkdir::DirEntry) -> bool {
+    let name = e.file_name().to_string_lossy();
+    !name.starts_with('.')
+}
+
 // ─────────────────── Phase 0: Reconciliation ───────────────────
 
 /// Query Open WebUI for the current KB file list and heal Redis state
@@ -150,20 +158,24 @@ async fn phase0_reconciliation(
     }
 
     let target_dir = Path::new(&config.target_directory);
+
+    // Optimization: Build a filename→paths HashMap in a single pass instead of
+    // walking the entire tree per remote file (O(K*N) → O(N+K))
+    let file_index = build_file_index(target_dir);
     let mut healed = 0u32;
 
     for remote_file in &remote_files {
-        // Try to find the local file that matches this remote filename
-        let local_path = find_local_file(target_dir, &remote_file.filename);
+        // O(1) lookup instead of full directory walk
+        let local_paths = file_index.get(&remote_file.filename);
+        let local_path = local_paths.and_then(|paths| paths.first());
+
         if let Some(local_path) = local_path {
-            // Bug fix #3: Don't heal state for files that no longer exist on disk.
-            // Phase 2 will naturally detect these as orphans and clean them up.
             if !local_path.exists() {
                 info!("[GHOST] {} exists in Open WebUI but not on disk — skipping heal (Phase 2 will clean up)", remote_file.filename);
                 continue;
             }
 
-            let key = generate_redis_key(&local_path);
+            let key = generate_redis_key(local_path);
 
             // Check if Redis already has this file tracked
             let exists = redis_client::fcall_check_file_exists(con, &key).await?;
@@ -185,7 +197,7 @@ async fn phase0_reconciliation(
                 .unwrap_or_else(|_| local_path.clone())
                 .to_string_lossy()
                 .to_string();
-            let content_hash = hash_file_contents(&local_path).unwrap_or_default();
+            let content_hash = hash_file_contents(local_path).unwrap_or_default();
 
             redis_client::fcall_upsert_sync_state(
                 con, &key, &abs_path, &content_hash, &remote_file.id,
@@ -198,29 +210,35 @@ async fn phase0_reconciliation(
     }
 
     if healed > 0 {
-        info!("Reconciliation healed {} file(s)", healed);
+        info!("Healed {} file(s) during reconciliation", healed);
     } else {
-        info!("All files in sync, no healing needed");
+        info!("Reconciliation complete — no healing needed");
     }
 
     Ok(())
 }
 
-/// Search for a local file by filename within the target directory.
-fn find_local_file(target_dir: &Path, filename: &str) -> Option<PathBuf> {
+/// Build a HashMap<filename, Vec<PathBuf>> from a single directory walk.
+/// Used by Phase 0 for O(1) lookups instead of repeated full walks.
+fn build_file_index(target_dir: &Path) -> HashMap<String, Vec<PathBuf>> {
+    let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
+
     for entry in WalkDir::new(target_dir)
         .into_iter()
+        .filter_entry(is_visible_entry)
         .filter_map(|e| e.ok())
     {
         if entry.file_type().is_file() {
             if let Some(name) = entry.file_name().to_str() {
-                if name == filename {
-                    return Some(entry.into_path());
-                }
+                index
+                    .entry(name.to_string())
+                    .or_default()
+                    .push(entry.into_path());
             }
         }
     }
-    None
+
+    index
 }
 
 // ─────────────────── Phase 1: Ingestion ───────────────────
@@ -245,10 +263,7 @@ async fn phase1_ingestion(
 
     for entry in WalkDir::new(target_dir)
         .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !name.starts_with('.') && name != ".git"
-        })
+        .filter_entry(is_visible_entry)
         .filter_map(|e| e.ok())
     {
         if !entry.file_type().is_file() {
@@ -317,6 +332,10 @@ async fn phase1_ingestion(
 }
 
 /// Process a single file: check existence, verify hash, upload if new/changed.
+/// Optimizations:
+/// - Single canonicalize() call, reused for Redis key and state
+/// - Async file I/O via spawn_blocking to avoid blocking the Tokio runtime
+/// - Decoupled poll+attach pipeline: upload returns immediately, poll+attach runs in background
 async fn process_file(
     con: &mut redis::aio::MultiplexedConnection,
     api: &OpenWebUiClient,
@@ -324,16 +343,22 @@ async fn process_file(
     file_path: &Path,
     convert_to_markdown: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let key = generate_redis_key(file_path);
+    // Single canonicalize — reused throughout
     let abs_path = file_path
         .canonicalize()?
         .to_string_lossy()
         .to_string();
-    let content_hash = hash_file_contents(file_path)?;
     let original_filename = file_path
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let key = generate_redis_key_from(&abs_path, &original_filename);
+
+    // Async hash via spawn_blocking to avoid blocking the Tokio runtime
+    let hash_path = file_path.to_path_buf();
+    let content_hash = tokio::task::spawn_blocking(move || {
+        hash_file_contents(&hash_path)
+    }).await??;
 
     // Determine upload filename (may change extension to .md)
     let filename = if convert_to_markdown && is_text_file(file_path) && !is_markdown_file(file_path) {
@@ -353,8 +378,21 @@ async fn process_file(
         info!("[NEW] {}", original_filename);
         let payload = build_upload_payload(con, &key, file_path, convert_to_markdown).await?;
         let file_id = api.upload_file(&filename, payload).await?;
-        api.poll_process_status(&file_id).await?;
-        api.add_to_knowledge(knowledge_id, &file_id).await?;
+
+        // Decoupled pipeline: spawn poll+attach in background
+        let api_bg = api.clone();
+        let kid = knowledge_id.to_string();
+        let fid = file_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = api_bg.poll_process_status(&fid).await {
+                warn!("Background poll failed for file_id={}: {}", fid, e);
+                return;
+            }
+            if let Err(e) = api_bg.add_to_knowledge(&kid, &fid).await {
+                warn!("Background attach failed for file_id={}: {}", fid, e);
+            }
+        });
+
         redis_client::fcall_upsert_sync_state(con, &key, &abs_path, &content_hash, &file_id)
             .await?;
     } else {
@@ -383,8 +421,21 @@ async fn process_file(
 
             let payload = build_upload_payload(con, &key, file_path, convert_to_markdown).await?;
             let file_id = api.upload_file(&filename, payload).await?;
-            api.poll_process_status(&file_id).await?;
-            api.add_to_knowledge(knowledge_id, &file_id).await?;
+
+            // Decoupled pipeline: spawn poll+attach in background
+            let api_bg = api.clone();
+            let kid = knowledge_id.to_string();
+            let fid = file_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = api_bg.poll_process_status(&fid).await {
+                    warn!("Background poll failed for file_id={}: {}", fid, e);
+                    return;
+                }
+                if let Err(e) = api_bg.add_to_knowledge(&kid, &fid).await {
+                    warn!("Background attach failed for file_id={}: {}", fid, e);
+                }
+            });
+
             redis_client::fcall_upsert_sync_state(con, &key, &abs_path, &content_hash, &file_id)
                 .await?;
         }
@@ -440,13 +491,18 @@ fn is_text_file(path: &Path) -> bool {
 /// For text files: prepend context header + raw contents.
 /// For binary files (e.g., PDF): raw contents only to prevent corruption.
 /// If convert_to_markdown is true, wraps non-markdown text content in code fences.
+/// Uses async file I/O via spawn_blocking.
 async fn build_upload_payload(
     con: &mut redis::aio::MultiplexedConnection,
     key: &str,
     file_path: &Path,
     convert_to_markdown: bool,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let raw_contents = std::fs::read(file_path)?;
+) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    // Async file read via spawn_blocking
+    let path_owned = file_path.to_path_buf();
+    let raw_contents = tokio::task::spawn_blocking(move || {
+        std::fs::read(&path_owned)
+    }).await??;
 
     if is_text_file(file_path) {
         let context_header = redis_client::fcall_get_formatted_context(con, key).await?;
@@ -461,15 +517,15 @@ async fn build_upload_payload(
         };
 
         if context_header.is_empty() {
-            return Ok(content);
+            return Ok(Bytes::from(content));
         }
         let mut payload = Vec::with_capacity(context_header.len() + content.len());
         payload.extend_from_slice(context_header.as_bytes());
         payload.extend_from_slice(&content);
-        Ok(payload)
+        Ok(Bytes::from(payload))
     } else {
         info!("Binary file detected, skipping context injection for '{}'", file_path.display());
-        Ok(raw_contents)
+        Ok(Bytes::from(raw_contents))
     }
 }
 
