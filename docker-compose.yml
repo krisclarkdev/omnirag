@@ -1,0 +1,46 @@
+services:
+  # ═══════════════════════════════════════════════════════════════
+  # Pod 1: project-alpha — first Knowledge Base
+  # ═══════════════════════════════════════════════════════════════
+  redis-alpha:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - ./redis-alpha:/data
+    restart: unless-stopped
+
+  omnirag-alpha:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./alpha-docs:/rag
+    environment:
+      - REDIS_URL=redis://redis-alpha:6379/0
+      - RUST_LOG=info,omnirag=debug
+    depends_on:
+      - redis-alpha
+    restart: unless-stopped
+
+  # ═══════════════════════════════════════════════════════════════
+  # Pod 2: project-beta — second Knowledge Base
+  # ═══════════════════════════════════════════════════════════════
+  redis-beta:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - ./redis-beta:/data
+    restart: unless-stopped
+
+  omnirag-beta:
+    build: .
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./beta-docs:/rag
+    environment:
+      - REDIS_URL=redis://redis-beta:6379/0
+      - RUST_LOG=info,omnirag=debug
+    depends_on:
+      - redis-beta
+    restart: unless-stopped

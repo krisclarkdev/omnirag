@@ -1,0 +1,31 @@
+# ── Rust ──────────────────────────────────────────────
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# ── Docker ────────────────────────────────────────────
+# Local volume mount directories (test data)
+/temp/
+/rag/
+/redis_data/
+/sqlite_data/
+/redis-*/
+/alpha-docs/
+
+# ── Secrets & Environment ────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── OS Files ──────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+
+# ── IDE ───────────────────────────────────────────────
+.vscode/
+.idea/
+*.iml
