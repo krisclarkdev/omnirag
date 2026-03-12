@@ -2,6 +2,39 @@
 
 A Rust application that synchronizes a local directory of files with an [Open WebUI](https://github.com/open-webui/open-webui) knowledge base. It hashes files, tracks state in Redis, dynamically prepends configurable context metadata, and interfaces with the Open WebUI REST API — deployed as a 1:1 Pod (one Rust container + one Redis container per Knowledge Base).
 
+---
+
+### ⚡ Quick Start
+
+```bash
+git clone https://github.com/krisclarkdev/omnirag.git && cd omnirag
+# Edit docker-compose.yml → set your documents path in the volume mount
+docker compose up --build -d
+# Open http://localhost:3000 → Configure → Trigger Sync
+```
+
+---
+
+## 📑 Table of Contents
+
+- [✨ Features](#-features)
+- [🚀 Quick Start](#-quick-start-1)
+- [🖥️ Production Deployment](#️-production-deployment)
+- [🏗️ Architecture: The 1:1 Pod](#️-architecture-the-11-pod)
+- [🧩 Best Practices: Chunking](#-best-practices-chunking)
+- [🤖 REST API (Automation)](#-rest-api-automation)
+- [💻 CLI](#-cli)
+- [🌐 Web UI](#-web-ui)
+- [🐳 Docker](#-docker)
+- [📐 Hardware Requirements & Scaling](#-hardware-requirements--scaling)
+- [🧪 Testing](#-testing)
+- [🔄 CI/CD](#-cicd)
+- [📁 Source Files](#-source-files)
+- [🧪 End-to-End Test Results](#-end-to-end-test-results)
+- [📄 License](#-license)
+
+---
+
 ## ✨ Features
 
 - **Three-phase sync** — Reconciles state, ingests new/updated files, and cleans up orphans
