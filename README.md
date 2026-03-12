@@ -59,7 +59,7 @@ services:
     restart: unless-stopped
 
   omnirag:
-    image: ghcr.io/<owner>/omnirag:main
+    image: ghcr.io/krisclarkdev/omnirag:main
     ports:
       - "3000:3000"
     volumes:
@@ -71,7 +71,75 @@ services:
     restart: unless-stopped
 ```
 
-> Replace `<owner>` with your GitHub username or organization name.
+---
+
+## 🖥️ Production Deployment
+
+Once the GitHub Actions workflow completes on `main`, the Docker image is published to GHCR. Deploy to your server with:
+
+```bash
+# 1. SSH into your production server
+ssh user@your-server
+
+# 2. Create working directory
+mkdir -p ~/omnirag && cd ~/omnirag
+
+# 3. Create a docker-compose.yml that pulls from GHCR
+cat > docker-compose.yml << 'EOF'
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - ./redis-data:/data
+    restart: unless-stopped
+
+  omnirag:
+    image: ghcr.io/krisclarkdev/omnirag:main
+    ports:
+      - "3000:3000"
+    volumes:
+      - /path/to/your/documents:/rag:ro
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+    restart: unless-stopped
+EOF
+
+# 4. Pull and start
+docker compose pull
+docker compose up -d
+
+# 5. Verify
+docker compose ps
+docker compose logs -f omnirag
+
+# 6. Open http://your-server:3000 → Configure → Trigger Sync
+```
+
+### Updating to Latest Version
+
+```bash
+cd ~/omnirag
+docker compose pull
+docker compose up -d
+```
+
+### Optional: Reverse Proxy (Nginx)
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name omnirag.yourdomain.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
 
 ---
 
