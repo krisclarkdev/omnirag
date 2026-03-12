@@ -8,8 +8,13 @@ A Rust application that synchronizes a local directory of files with an [Open We
 
 ```bash
 git clone https://github.com/krisclarkdev/omnirag.git && cd omnirag
-# Edit docker-compose.yml → set your documents path in the volume mount
-docker compose up --build -d
+
+# ⚠️ Edit docker-compose.yml before starting:
+#   1. Change ./alpha-docs to the path to your documents folder
+#   2. Change ./redis-alpha to where you want Redis data persisted (or leave as-is)
+
+docker compose pull
+docker compose up -d
 # Open http://localhost:3000 → Configure → Trigger Sync
 ```
 
@@ -68,11 +73,13 @@ docker compose up --build -d
 # 1. Clone
 git clone https://github.com/krisclarkdev/omnirag.git && cd omnirag
 
-# 2. Create your documents directory
-mkdir -p my-docs && cp /path/to/your/docs/* my-docs/
+# 2. ⚠️ Edit docker-compose.yml:
+#    - Change ./alpha-docs to the path to your documents folder
+#    - Change ./redis-alpha to where you want Redis data persisted (or leave as-is)
 
-# 3. Deploy (starts both the Rust app and its dedicated Redis)
-docker compose up --build -d
+# 3. Pull and deploy
+docker compose pull
+docker compose up -d
 
 # 4. Configure via http://localhost:3000
 # 5. Click "▶ Trigger Sync" in the UI

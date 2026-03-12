@@ -6,15 +6,17 @@ services:
     image: redis:7-alpine
     command: redis-server --appendonly yes
     volumes:
+      # ⚠️ Redis persistence — change ./redis-alpha to your preferred path
       - ./redis-alpha:/data
     restart: unless-stopped
 
   omnirag-alpha:
-    build: .
+    image: ghcr.io/krisclarkdev/omnirag:main
     ports:
       - "3000:3000"
     volumes:
-      - ./alpha-docs:/rag
+      # ⚠️ Your documents — change ./alpha-docs to your local folder path
+      - ./alpha-docs:/rag:ro
     environment:
       - REDIS_URL=redis://redis-alpha:6379/0
       - RUST_LOG=info,omnirag=debug
@@ -23,24 +25,25 @@ services:
     restart: unless-stopped
 
   # ═══════════════════════════════════════════════════════════════
-  # Pod 2: project-beta — second Knowledge Base
+  # Pod 2: project-beta — second Knowledge Base (optional)
+  # Uncomment to run a second isolated sync for another KB.
   # ═══════════════════════════════════════════════════════════════
-  redis-beta:
-    image: redis:7-alpine
-    command: redis-server --appendonly yes
-    volumes:
-      - ./redis-beta:/data
-    restart: unless-stopped
+  # redis-beta:
+  #   image: redis:7-alpine
+  #   command: redis-server --appendonly yes
+  #   volumes:
+  #     - ./redis-beta:/data
+  #   restart: unless-stopped
 
-  omnirag-beta:
-    build: .
-    ports:
-      - "3001:3000"
-    volumes:
-      - ./beta-docs:/rag
-    environment:
-      - REDIS_URL=redis://redis-beta:6379/0
-      - RUST_LOG=info,omnirag=debug
-    depends_on:
-      - redis-beta
-    restart: unless-stopped
+  # omnirag-beta:
+  #   image: ghcr.io/krisclarkdev/omnirag:main
+  #   ports:
+  #     - "3001:3000"
+  #   volumes:
+  #     - ./beta-docs:/rag:ro
+  #   environment:
+  #     - REDIS_URL=redis://redis-beta:6379/0
+  #     - RUST_LOG=info,omnirag=debug
+  #   depends_on:
+  #     - redis-beta
+  #   restart: unless-stopped
