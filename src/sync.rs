@@ -379,22 +379,31 @@ async fn process_file(
         let payload = build_upload_payload(con, &key, file_path, convert_to_markdown).await?;
         let file_id = api.upload_file(&filename, payload).await?;
 
-        // Decoupled pipeline: spawn poll+attach in background
+        // Decoupled pipeline: poll+attach+record all run in background.
+        // Redis state is only written AFTER successful KB attachment,
+        // so failures will be retried on the next sync.
         let api_bg = api.clone();
+        let mut con_bg = con.clone();
         let kid = knowledge_id.to_string();
         let fid = file_id.clone();
+        let key_bg = key.clone();
+        let abs_bg = abs_path.clone();
+        let hash_bg = content_hash.clone();
         tokio::spawn(async move {
             if let Err(e) = api_bg.poll_process_status(&fid).await {
-                warn!("Background poll failed for file_id={}: {}", fid, e);
+                warn!("Background poll failed for file_id={}: {} (will retry next sync)", fid, e);
                 return;
             }
             if let Err(e) = api_bg.add_to_knowledge(&kid, &fid).await {
-                warn!("Background attach failed for file_id={}: {}", fid, e);
+                warn!("Background attach failed for file_id={}: {} (will retry next sync)", fid, e);
+                return;
+            }
+            if let Err(e) = redis_client::fcall_upsert_sync_state(
+                &mut con_bg, &key_bg, &abs_bg, &hash_bg, &fid,
+            ).await {
+                warn!("Background Redis state update failed for file_id={}: {}", fid, e);
             }
         });
-
-        redis_client::fcall_upsert_sync_state(con, &key, &abs_path, &content_hash, &file_id)
-            .await?;
     } else {
         // File exists — check if contents changed
         let hash_matches = redis_client::fcall_verify_file_hash(con, &key, &content_hash).await?;
@@ -422,22 +431,29 @@ async fn process_file(
             let payload = build_upload_payload(con, &key, file_path, convert_to_markdown).await?;
             let file_id = api.upload_file(&filename, payload).await?;
 
-            // Decoupled pipeline: spawn poll+attach in background
+            // Decoupled pipeline: poll+attach+record all run in background.
             let api_bg = api.clone();
+            let mut con_bg = con.clone();
             let kid = knowledge_id.to_string();
             let fid = file_id.clone();
+            let key_bg = key.clone();
+            let abs_bg = abs_path.clone();
+            let hash_bg = content_hash.clone();
             tokio::spawn(async move {
                 if let Err(e) = api_bg.poll_process_status(&fid).await {
-                    warn!("Background poll failed for file_id={}: {}", fid, e);
+                    warn!("Background poll failed for file_id={}: {} (will retry next sync)", fid, e);
                     return;
                 }
                 if let Err(e) = api_bg.add_to_knowledge(&kid, &fid).await {
-                    warn!("Background attach failed for file_id={}: {}", fid, e);
+                    warn!("Background attach failed for file_id={}: {} (will retry next sync)", fid, e);
+                    return;
+                }
+                if let Err(e) = redis_client::fcall_upsert_sync_state(
+                    &mut con_bg, &key_bg, &abs_bg, &hash_bg, &fid,
+                ).await {
+                    warn!("Background Redis state update failed for file_id={}: {}", fid, e);
                 }
             });
-
-            redis_client::fcall_upsert_sync_state(con, &key, &abs_path, &content_hash, &file_id)
-                .await?;
         }
     }
 
