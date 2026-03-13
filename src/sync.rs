@@ -1,14 +1,14 @@
 use crate::api::OpenWebUiClient;
 use crate::config::AppConfig;
 use crate::hashing::{generate_redis_key, generate_redis_key_from, hash_file_contents};
-use crate::redis_client;
+use crate::redis_client::{self, FileCheckResult};
 
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{error, info, warn};
 use walkdir::WalkDir;
 
@@ -31,6 +31,18 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "xml", "html", "htm", "rst", "log", "cfg", "ini", "conf",
     "py", "rs", "go", "js", "ts", "sh", "bat", "ps1",
 ];
+
+/// Info needed to retry a failed background attach at the end of sync.
+#[derive(Debug, Clone)]
+struct PendingAttach {
+    file_id: String,
+    knowledge_id: String,
+    key: String,
+    abs_path: String,
+    content_hash: String,
+    mtime: String,
+    size: String,
+}
 
 /// Run the full sync: Phase 0 (Reconciliation) + Phase 1 (Ingestion) + Phase 2 (Orphan Cleanup).
 pub async fn run_sync(
@@ -159,13 +171,11 @@ async fn phase0_reconciliation(
 
     let target_dir = Path::new(&config.target_directory);
 
-    // Optimization: Build a filename→paths HashMap in a single pass instead of
-    // walking the entire tree per remote file (O(K*N) → O(N+K))
+    // Build a HashMap<filename, Vec<PathBuf>> in a single walk for O(1) lookups
     let file_index = build_file_index(target_dir);
     let mut healed = 0u32;
 
     for remote_file in &remote_files {
-        // O(1) lookup instead of full directory walk
         let local_paths = file_index.get(&remote_file.filename);
         let local_path = local_paths.and_then(|paths| paths.first());
 
@@ -177,10 +187,8 @@ async fn phase0_reconciliation(
 
             let key = generate_redis_key(local_path);
 
-            // Check if Redis already has this file tracked
             let exists = redis_client::fcall_check_file_exists(con, &key).await?;
             if exists {
-                // Verify the stored file_id matches
                 let stored_id: Option<String> = redis::cmd("HGET")
                     .arg(&key)
                     .arg("openwebui_file_id")
@@ -188,19 +196,24 @@ async fn phase0_reconciliation(
                     .await?;
 
                 if stored_id.as_deref() == Some(&remote_file.id) {
-                    continue; // Already in sync
+                    continue;
                 }
             }
 
-            // Heal: update Redis with the correct remote file_id
             let abs_path = local_path.canonicalize()
                 .unwrap_or_else(|_| local_path.clone())
                 .to_string_lossy()
                 .to_string();
             let content_hash = hash_file_contents(local_path).unwrap_or_default();
+            let meta = std::fs::metadata(local_path).ok();
+            let mtime = meta.as_ref()
+                .and_then(|m| m.modified().ok())
+                .map(|t| format!("{:?}", t))
+                .unwrap_or_default();
+            let size = meta.map(|m| m.len().to_string()).unwrap_or_default();
 
             redis_client::fcall_upsert_sync_state(
-                con, &key, &abs_path, &content_hash, &remote_file.id,
+                con, &key, &abs_path, &content_hash, &remote_file.id, &mtime, &size,
             )
             .await?;
 
@@ -219,7 +232,6 @@ async fn phase0_reconciliation(
 }
 
 /// Build a HashMap<filename, Vec<PathBuf>> from a single directory walk.
-/// Used by Phase 0 for O(1) lookups instead of repeated full walks.
 fn build_file_index(target_dir: &Path) -> HashMap<String, Vec<PathBuf>> {
     let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
 
@@ -244,6 +256,7 @@ fn build_file_index(target_dir: &Path) -> HashMap<String, Vec<PathBuf>> {
 // ─────────────────── Phase 1: Ingestion ───────────────────
 
 /// Phase 1: Walk directory, detect new/updated/unchanged files, upload as needed.
+/// Uses fire-and-forget upload pattern with a retry list collected at the end.
 async fn phase1_ingestion(
     con: &mut redis::aio::MultiplexedConnection,
     config: &AppConfig,
@@ -272,18 +285,15 @@ async fn phase1_ingestion(
 
         let path = entry.into_path();
 
-        // Filter: OS files
         if is_os_ignored(&path) {
             continue;
         }
 
-        // Filter: .ragignore
         if is_ragignored(&path, target_dir, &ragignore_patterns) {
             skipped_ignore += 1;
             continue;
         }
 
-        // Filter: extension whitelist
         if !has_allowed_extension(&path) {
             skipped_ext += 1;
             continue;
@@ -303,6 +313,10 @@ async fn phase1_ingestion(
         config.max_concurrent_uploads as usize
     };
     let semaphore = Arc::new(Semaphore::new(max));
+
+    // Shared retry list for failed background attaches
+    let retry_list: Arc<Mutex<Vec<PendingAttach>>> = Arc::new(Mutex::new(Vec::new()));
+
     let mut handles = Vec::new();
 
     for file_path in files {
@@ -311,12 +325,12 @@ async fn phase1_ingestion(
         let api = api.clone();
         let knowledge_id = config.openwebui_knowledge_id.clone();
         let convert_md = config.convert_to_markdown;
+        let retries = retry_list.clone();
 
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
 
-            if let Err(e) = process_file(&mut con, &api, &knowledge_id, &file_path, convert_md).await {
-                // Non-fatal: log and skip, don't crash the sync
+            if let Err(e) = process_file(&mut con, &api, &knowledge_id, &file_path, convert_md, retries).await {
                 warn!("Failed to process '{}': {} (will retry on next sync)", file_path.display(), e);
             }
         }));
@@ -328,20 +342,45 @@ async fn phase1_ingestion(
         }
     }
 
+    // ── Retry phase: process any files that failed to attach ──
+    let pending = retry_list.lock().await;
+    if !pending.is_empty() {
+        info!("=== Phase 1b: Retrying {} failed attach(es) ===", pending.len());
+        for item in pending.iter() {
+            info!("[RETRY] file_id={}", item.file_id);
+            if let Err(e) = api.add_to_knowledge(&item.knowledge_id, &item.file_id).await {
+                warn!("Retry attach failed for file_id={}: {} (will retry next sync)", item.file_id, e);
+                continue;
+            }
+            // Attach succeeded — write Redis state
+            let mut retry_con = con.clone();
+            if let Err(e) = redis_client::fcall_upsert_sync_state(
+                &mut retry_con,
+                &item.key,
+                &item.abs_path,
+                &item.content_hash,
+                &item.file_id,
+                &item.mtime,
+                &item.size,
+            ).await {
+                warn!("Retry Redis update failed for file_id={}: {}", item.file_id, e);
+            }
+        }
+    }
+
     Ok(())
 }
 
-/// Process a single file: check existence, verify hash, upload if new/changed.
-/// Optimizations:
-/// - Single canonicalize() call, reused for Redis key and state
-/// - Async file I/O via spawn_blocking to avoid blocking the Tokio runtime
-/// - Decoupled poll+attach pipeline: upload returns immediately, poll+attach runs in background
+/// Process a single file: check metadata+hash, upload if new/changed.
+/// Uses fire-and-forget pattern: upload completes, attach runs in background,
+/// failures are collected into the retry list for Phase 1b.
 async fn process_file(
     con: &mut redis::aio::MultiplexedConnection,
     api: &OpenWebUiClient,
     knowledge_id: &str,
     file_path: &Path,
     convert_to_markdown: bool,
+    retry_list: Arc<Mutex<Vec<PendingAttach>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Single canonicalize — reused throughout
     let abs_path = file_path
@@ -354,68 +393,41 @@ async fn process_file(
         .unwrap_or_else(|| "unknown".to_string());
     let key = generate_redis_key_from(&abs_path, &original_filename);
 
-    // Async hash via spawn_blocking to avoid blocking the Tokio runtime
+    // Get file metadata (mtime + size) for skip-early optimization
+    let meta_path = file_path.to_path_buf();
+    let (mtime_str, size_str) = tokio::task::spawn_blocking(move || {
+        let meta = std::fs::metadata(&meta_path).ok();
+        let mtime = meta.as_ref()
+            .and_then(|m| m.modified().ok())
+            .map(|t| format!("{:?}", t))
+            .unwrap_or_default();
+        let size = meta.map(|m| m.len().to_string()).unwrap_or_default();
+        (mtime, size)
+    }).await?;
+
+    // Async hash via spawn_blocking
     let hash_path = file_path.to_path_buf();
     let content_hash = tokio::task::spawn_blocking(move || {
         hash_file_contents(&hash_path)
     }).await??;
 
-    // Determine upload filename (may change extension to .md)
-    let filename = if convert_to_markdown && is_text_file(file_path) && !is_markdown_file(file_path) {
-        let stem = file_path.file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        format!("{}.md", stem)
-    } else {
-        original_filename.clone()
-    };
+    // Single Redis round-trip: check existence + compare metadata + compare hash
+    let check_result = redis_client::fcall_check_and_compare(
+        con, &key, &mtime_str, &size_str, &content_hash,
+    ).await?;
 
-    // Step 1: Check if file exists in Redis
-    let exists = redis_client::fcall_check_file_exists(con, &key).await?;
-
-    if !exists {
-        // Condition A: New file
-        info!("[NEW] {}", original_filename);
-        let payload = build_upload_payload(con, &key, file_path, convert_to_markdown).await?;
-        let file_id = api.upload_file(&filename, payload).await?;
-
-        // Decoupled pipeline: poll+attach+record all run in background.
-        // Redis state is only written AFTER successful KB attachment,
-        // so failures will be retried on the next sync.
-        let api_bg = api.clone();
-        let mut con_bg = con.clone();
-        let kid = knowledge_id.to_string();
-        let fid = file_id.clone();
-        let key_bg = key.clone();
-        let abs_bg = abs_path.clone();
-        let hash_bg = content_hash.clone();
-        tokio::spawn(async move {
-            if let Err(e) = api_bg.poll_process_status(&fid).await {
-                warn!("Background poll failed for file_id={}: {} (will retry next sync)", fid, e);
-                return;
-            }
-            if let Err(e) = api_bg.add_to_knowledge(&kid, &fid).await {
-                warn!("Background attach failed for file_id={}: {} (will retry next sync)", fid, e);
-                return;
-            }
-            if let Err(e) = redis_client::fcall_upsert_sync_state(
-                &mut con_bg, &key_bg, &abs_bg, &hash_bg, &fid,
-            ).await {
-                warn!("Background Redis state update failed for file_id={}: {}", fid, e);
-            }
-        });
-    } else {
-        // File exists — check if contents changed
-        let hash_matches = redis_client::fcall_verify_file_hash(con, &key, &content_hash).await?;
-
-        if hash_matches {
-            // Condition B: Unchanged — skip
-            info!("[SKIP] {}", original_filename);
-        } else {
-            // Condition C: Updated file
+    match check_result {
+        FileCheckResult::Unchanged => {
+            // Skip — metadata or hash matches, not dirty
+            return Ok(());
+        }
+        FileCheckResult::New => {
+            info!("[NEW] {}", original_filename);
+        }
+        FileCheckResult::Changed => {
             info!("[UPDATE] {}", original_filename);
 
-            // Get the old file ID to delete
+            // Delete the old file from Open WebUI
             let old_file_id: Option<String> = redis::cmd("HGET")
                 .arg(&key)
                 .arg("openwebui_file_id")
@@ -427,35 +439,57 @@ async fn process_file(
                     warn!("Failed to delete old file {}: {}", old_id, e);
                 }
             }
-
-            let payload = build_upload_payload(con, &key, file_path, convert_to_markdown).await?;
-            let file_id = api.upload_file(&filename, payload).await?;
-
-            // Decoupled pipeline: poll+attach+record all run in background.
-            let api_bg = api.clone();
-            let mut con_bg = con.clone();
-            let kid = knowledge_id.to_string();
-            let fid = file_id.clone();
-            let key_bg = key.clone();
-            let abs_bg = abs_path.clone();
-            let hash_bg = content_hash.clone();
-            tokio::spawn(async move {
-                if let Err(e) = api_bg.poll_process_status(&fid).await {
-                    warn!("Background poll failed for file_id={}: {} (will retry next sync)", fid, e);
-                    return;
-                }
-                if let Err(e) = api_bg.add_to_knowledge(&kid, &fid).await {
-                    warn!("Background attach failed for file_id={}: {} (will retry next sync)", fid, e);
-                    return;
-                }
-                if let Err(e) = redis_client::fcall_upsert_sync_state(
-                    &mut con_bg, &key_bg, &abs_bg, &hash_bg, &fid,
-                ).await {
-                    warn!("Background Redis state update failed for file_id={}: {}", fid, e);
-                }
-            });
         }
     }
+
+    // Determine upload filename (may change extension to .md)
+    let filename = if convert_to_markdown && is_text_file(file_path) && !is_markdown_file(file_path) {
+        let stem = file_path.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        format!("{}.md", stem)
+    } else {
+        original_filename.clone()
+    };
+
+    // Upload the file
+    let payload = build_upload_payload(con, &key, file_path, convert_to_markdown).await?;
+    let file_id = api.upload_file(&filename, payload).await?;
+
+    // Fire-and-forget: attach to KB in background, collect failures for retry
+    let api_bg = api.clone();
+    let mut con_bg = con.clone();
+    let pending = PendingAttach {
+        file_id: file_id.clone(),
+        knowledge_id: knowledge_id.to_string(),
+        key: key.clone(),
+        abs_path: abs_path.clone(),
+        content_hash: content_hash.clone(),
+        mtime: mtime_str.clone(),
+        size: size_str.clone(),
+    };
+    let retries = retry_list.clone();
+
+    tokio::spawn(async move {
+        // Skip polling — just attach directly. Open WebUI processes async regardless.
+        if let Err(e) = api_bg.add_to_knowledge(&pending.knowledge_id, &pending.file_id).await {
+            warn!("Background attach failed for file_id={}, queuing for retry: {}", pending.file_id, e);
+            retries.lock().await.push(pending);
+            return;
+        }
+        // Attach succeeded — write Redis state
+        if let Err(e) = redis_client::fcall_upsert_sync_state(
+            &mut con_bg,
+            &pending.key,
+            &pending.abs_path,
+            &pending.content_hash,
+            &pending.file_id,
+            &pending.mtime,
+            &pending.size,
+        ).await {
+            warn!("Background Redis state update failed for file_id={}: {}", pending.file_id, e);
+        }
+    });
 
     Ok(())
 }
@@ -572,14 +606,12 @@ async fn phase2_cleanup(
                 let reason = if missing { "missing" } else { "filtered" };
                 info!("[ORPHAN:{}] {} → deleting", reason, path);
 
-                // Delete from Open WebUI if we have a file ID
                 if !file_id.is_empty() {
                     if let Err(e) = api.delete_file(file_id).await {
                         warn!("Failed to delete orphan file_id={}: {}", file_id, e);
                     }
                 }
 
-                // Delete key from Redis
                 let _: () = redis::cmd("DEL")
                     .arg(key)
                     .query_async(con)

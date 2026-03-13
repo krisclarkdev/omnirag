@@ -773,7 +773,7 @@ fn render_config_form_with_status(config: &AppConfig, message: &str, color: &str
     <div>
         <div class="flex items-center gap-1.5 mb-1.5">
             <label class="block text-xs font-medium text-zinc-400">Max Concurrent Uploads</label>
-            <span class="help-btn" onclick="showHelp('Max Concurrent Uploads', '<p>Controls how many files are uploaded to Open WebUI simultaneously during Phase 1 ingestion.</p><p class=&quot;mt-2&quot;>Set to <code class=&quot;text-sky-400&quot;>0</code> for unlimited concurrency (all files upload at once). Higher values speed up sync but may overwhelm slower Open WebUI instances.</p><p class=&quot;mt-2&quot;>Default is <code class=&quot;text-sky-400&quot;>5</code>.</p>')">?</span>
+            <span class="help-btn" onclick="showHelp('Max Concurrent Uploads', '<p>Controls how many files are uploaded to Open WebUI simultaneously during sync.</p><p class=&quot;mt-2&quot;>Set to <code class=&quot;text-sky-400&quot;>0</code> for unlimited concurrency. Higher values speed up sync but may overwhelm slower Open WebUI instances. If you see rate-limit errors (401/429), reduce this value.</p><p class=&quot;mt-2&quot;>Default is <code class=&quot;text-sky-400&quot;>5</code>.</p>')">?</span>
         </div>
         <input type="number" name="max_concurrent_uploads" value="{max_concurrent_uploads}" min="0"
                class="w-full px-4 py-2.5 rounded-xl bg-zinc-800/80 border border-zinc-700 text-zinc-100 text-sm placeholder-zinc-500 focus:outline-none focus:border-sky-500 transition-colors"

@@ -26,6 +26,42 @@ pub async fn load_functions(
     }
 }
 
+/// Result of the combined check_and_compare FCALL.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FileCheckResult {
+    /// File does not exist in Redis — new file, needs upload
+    New,
+    /// File exists, hash matches, not dirty — skip
+    Unchanged,
+    /// File exists but hash/metadata changed or dirty — needs re-upload
+    Changed,
+}
+
+/// FCALL check_and_compare 1 <key> <mtime> <size> <content_hash>
+/// Single round-trip: checks existence, compares mtime+size, then hash if needed.
+pub async fn fcall_check_and_compare(
+    con: &mut redis::aio::MultiplexedConnection,
+    key: &str,
+    mtime: &str,
+    size: &str,
+    content_hash: &str,
+) -> Result<FileCheckResult, Box<dyn std::error::Error + Send + Sync>> {
+    let result: i64 = redis::cmd("FCALL")
+        .arg("check_and_compare")
+        .arg(1)
+        .arg(key)
+        .arg(mtime)
+        .arg(size)
+        .arg(content_hash)
+        .query_async(con)
+        .await?;
+    match result {
+        0 => Ok(FileCheckResult::New),
+        1 => Ok(FileCheckResult::Unchanged),
+        _ => Ok(FileCheckResult::Changed),
+    }
+}
+
 /// FCALL get_formatted_context 1 <key>
 pub async fn fcall_get_formatted_context(
     con: &mut redis::aio::MultiplexedConnection,
@@ -40,7 +76,7 @@ pub async fn fcall_get_formatted_context(
     Ok(result)
 }
 
-/// FCALL check_file_exists 1 <key>
+/// FCALL check_file_exists 1 <key> (LEGACY — kept for tests)
 pub async fn fcall_check_file_exists(
     con: &mut redis::aio::MultiplexedConnection,
     key: &str,
@@ -54,7 +90,7 @@ pub async fn fcall_check_file_exists(
     Ok(result == 1)
 }
 
-/// FCALL verify_file_hash 1 <key> <local_content_hash>
+/// FCALL verify_file_hash 1 <key> <local_content_hash> (LEGACY — kept for tests)
 pub async fn fcall_verify_file_hash(
     con: &mut redis::aio::MultiplexedConnection,
     key: &str,
@@ -70,13 +106,15 @@ pub async fn fcall_verify_file_hash(
     Ok(result == 1)
 }
 
-/// FCALL upsert_sync_state 1 <key> <absolute_path> <content_hash> <openwebui_file_id>
+/// FCALL upsert_sync_state 1 <key> <absolute_path> <content_hash> <openwebui_file_id> <mtime> <size>
 pub async fn fcall_upsert_sync_state(
     con: &mut redis::aio::MultiplexedConnection,
     key: &str,
     absolute_path: &str,
     content_hash: &str,
     openwebui_file_id: &str,
+    mtime: &str,
+    size: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     redis::cmd("FCALL")
         .arg("upsert_sync_state")
@@ -85,6 +123,8 @@ pub async fn fcall_upsert_sync_state(
         .arg(absolute_path)
         .arg(content_hash)
         .arg(openwebui_file_id)
+        .arg(mtime)
+        .arg(size)
         .query_async::<i64>(con)
         .await?;
     Ok(())
@@ -122,6 +162,7 @@ pub async fn fcall_get_cleanup_batch(
 }
 
 /// Scan all tracked file keys and return (key, absolute_path, context_text) for each.
+/// Uses HMGET for batch field retrieval (single call per key instead of 2).
 pub async fn scan_all_tracked_files(
     con: &mut redis::aio::MultiplexedConnection,
 ) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error + Send + Sync>> {
@@ -140,18 +181,17 @@ pub async fn scan_all_tracked_files(
             if key == "config:global" {
                 continue;
             }
-            let path: Option<String> = redis::cmd("HGET")
+            // HMGET: single round-trip for both fields (was 2 separate HGET calls)
+            let fields: Vec<Option<String>> = redis::cmd("HMGET")
                 .arg(key)
                 .arg("absolute_path")
-                .query_async(con)
-                .await?;
-            let ctx: Option<String> = redis::cmd("HGET")
-                .arg(key)
                 .arg("context_text")
                 .query_async(con)
                 .await?;
-            if let Some(path) = path {
-                files.push((key.clone(), path, ctx.unwrap_or_default()));
+
+            if let Some(path) = fields.get(0).and_then(|f| f.clone()) {
+                let ctx = fields.get(1).and_then(|f| f.clone()).unwrap_or_default();
+                files.push((key.clone(), path, ctx));
             }
         }
 
