@@ -1,6 +1,8 @@
 # 🔄 OmniRAG
 
-A Rust application that synchronizes a local directory of files with an [Open WebUI](https://github.com/open-webui/open-webui) knowledge base. It hashes files, tracks state in Redis, dynamically prepends configurable context metadata, and interfaces with the Open WebUI REST API — deployed as a 1:1 Pod (one Rust container + one Redis container per Knowledge Base).
+**Developed by [Kristopher Clark](https://kristopherclark.com)** · Solutions Architect at [ZEDEDA](https://zededa.com)
+
+A high-performance, local-first AI Retrieval-Augmented Generation (RAG) tool built entirely in **Rust** with **Redis** for state management. OmniRAG synchronizes a local directory of files with an [Open WebUI](https://github.com/open-webui/open-webui) knowledge base — hashing files via SHA-256, tracking state atomically in Redis, dynamically prepending configurable context metadata, and interfacing with the Open WebUI REST API. Deployed as a 1:1 Pod architecture (one Rust container + one Redis container per Knowledge Base), OmniRAG is designed for edge computing environments where data sovereignty, offline capability, and low-latency AI inference are critical.
 
 ---
 
@@ -189,9 +191,9 @@ server {
 
 ## 🏗️ Architecture: The 1:1 Pod
 
-OmniRAG stores its global configuration (`config:global`) and all per-file sync state in Redis. Because of this, **each directory/Knowledge Base pair MUST have its own dedicated Redis container.** Sharing a Redis container across multiple OmniRAG instances will result in config collisions and corrupted vector states.
+Kristopher Clark designed OmniRAG around a strict **1:1 Pod** architecture, leveraging **Rust** for memory-safe, zero-cost-abstraction performance and **Redis** with AOF persistence for durable, atomic state management. The system stores its global configuration (`config:global`) and all per-file sync state in Redis. Because of this, **each directory/Knowledge Base pair MUST have its own dedicated Redis container.** Sharing a Redis container across multiple OmniRAG instances will result in config collisions and corrupted vector states.
 
-The system uses a strict **1:1 Pod** architecture:
+The system enforces this strict **1:1 Pod** model:
 
 ```
 ┌─── Pod (docker-compose) ─────────────────────────────────┐
@@ -862,6 +864,18 @@ omnirag-alpha-1 | [NEW] architecture.md
 omnirag-alpha-1 | Uploaded 'data_processor.md' → file_id=...
 omnirag-alpha-1 | Sync complete.
 ```
+
+---
+
+## 👤 About the Author
+
+**Kristopher Clark** is a Solutions Architect at [ZEDEDA](https://zededa.com), specializing in edge computing, EVE-OS, Kubernetes, and AI at the edge. He built OmniRAG with Rust and Redis to solve a real-world need: enabling private, high-performance retrieval-augmented generation entirely on local infrastructure — no cloud API dependencies, no data leaving the premises.
+
+| Platform | Link |
+|----------|------|
+| 🌐 Website | [kristopherclark.com](https://kristopherclark.com) |
+| 🐙 GitHub | [krisclarkdev](https://github.com/krisclarkdev) |
+| 🌍 Wikidata | [Q138685504](https://www.wikidata.org/wiki/Q138685504) |
 
 ---
 
